@@ -209,45 +209,7 @@ for !condition{
 
   FIFO
   
-  也有资料说这种效率不高，可以换成随机唤醒，但代码里是唤醒最后一个
-  
-```
-func notifyListNotifyOne(l *notifyList) {
-
-   if atomic.Load(&l.wait) == atomic.Load(&l.notify) { //step a
-        return
-   }
-
-   lock(&l.lock) //step b
-
-   t := l.notify
-   if t == atomic.Load(&l.wait) {
-        unlock(&l.lock)
-        return
-   }
-
-   atomic.Store(&l.notify, t+1)  
-
-   for p, s := (*sudog)(nil), l.head; s != nil; p, s = s, s.next { //step c
-        if s.ticket == t {
-           n := s.next
-           if p != nil {
-               p.next = n
-           } else {
-               l.head = n
-           }
-           if n == nil {
-               l.tail = p
-           }
-           unlock(&l.lock)
-           s.next = nil
-           readyWithTime(s, 4)
-           return
-       }
-   }
-   unlock(&l.lock)
-}
-```
+  也有资料说这种效率不高，可以换成随机唤醒
 
 # 示例
 ```
