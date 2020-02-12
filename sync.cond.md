@@ -7,16 +7,16 @@ Cond实现了一个条件变量，一个等待或宣布事件发生的goroutines
 type Cond struct {
     noCopy noCopy               // noCopy可以嵌入到结构中，在第一次使用后不可复制,使用go vet作为检测使用
     L Locker                    // 根据需求初始化不同的锁，如*Mutex 和 *RWMutex
-    notify  notifyList          // 通知列表,调用Wait()方法的goroutine会被放入list中,每次唤醒,从这里取出
+    notify  notifyList          // 通知列表,使用链表实现,调用Wait()方法的goroutine会被放入list中,每次唤醒,从这里取出
     checker copyChecker         // 复制检查,检查cond实例是否被复制
 }
 
 type notifyList struct {
-    wait   uint32       //无限自增，有新的goroutine等待时+1
-    notify uint32       //无限自增，有新的唤醒信号的时候+1
-    lock   uintptr
-    head   unsafe.Pointer
-    tail   unsafe.Pointer
+    wait   uint32       //等待数量。无限自增，有新的goroutine等待时+1
+    notify uint32       //通知数量。无限自增，有新的唤醒信号的时候+1
+    lock   uintptr	//锁对象
+    head   *sudog	//链表头
+    tail   *sudog	//链表尾
 }
 
 type copyChecker uintptr
@@ -28,6 +28,8 @@ func (c *copyChecker) check() {
         panic("sync.Cond is copied")
     }
 }
+
+
 ```
 # 方法
 
@@ -51,6 +53,38 @@ func (c *Cond) Broadcast() {
     runtime_notifyListNotifyAll(&c.notify)  // 唤醒等待队列中所有的goroutine
 }
 ```
+按照加入链表的顺序唤醒所有
+```
+func notifyListNotifyAll(l *notifyList) {
+    // Fast-path: if there are no new waiters since the last notification
+    // we don't need to acquire the lock.
+    if atomic.Load(&l.wait) == atomic.Load(&l.notify) {
+        return
+    }
+
+    // Pull the list out into a local variable, waiters will be readied
+    // outside the lock.
+    lock(&l.lock)
+    s := l.head
+    l.head = nil
+    l.tail = nil
+
+    // Update the next ticket to be notified. We can set it to the current
+    // value of wait because any previous waiters are already in the list
+    // or will notice that they have already been notified when trying to
+    // add themselves to the list.
+    atomic.Store(&l.notify, atomic.Load(&l.wait))
+    unlock(&l.lock)
+
+    // Go through the local list and ready all waiters.
+    for s != nil {
+        next := s.next
+        s.next = nil
+        readyWithTime(s, 4)
+        s = next
+    }
+}
+```
 ## Signal
   
   唤醒一个因等待条件变量 c 阻塞的 goroutine
@@ -58,6 +92,43 @@ func (c *Cond) Broadcast() {
 func (c *Cond) Signal() {
     c.checker.check()                       // 检查c是否是被复制的，如果是就panic
     runtime_notifyListNotifyOne(&c.notify)  // 通知等待列表中的一个 
+}
+```
+唤醒链表头
+```
+func notifyListNotifyOne(l *notifyList) {
+    if atomic.Load(&l.wait) == atomic.Load(&l.notify) {
+        return
+    }
+
+    lock(&l.lock)
+
+    t := l.notify
+    if t == atomic.Load(&l.wait) {
+        unlock(&l.lock)
+        return
+    }
+
+    atomic.Store(&l.notify, t+1)
+    
+    for p, s := (*sudog)(nil), l.head; s != nil; p, s = s, s.next {
+        if s.ticket == t {
+            n := s.next
+            if p != nil {
+                p.next = n
+            } else {
+                l.head = n
+            }
+            if n == nil {
+                l.tail = p
+            }
+            unlock(&l.lock)
+            s.next = nil
+            readyWithTime(s, 4)
+            return
+        }
+    }
+    unlock(&l.lock)
 }
 ```
 
@@ -71,6 +142,40 @@ func (c *Cond) Wait() {
     c.L.Unlock()                            // 解锁
     runtime_notifyListWait(&c.notify, t)    // 等待队列中的所有的goroutine执行等待唤醒操作
     c.L.Lock()                              //再次上锁
+}
+```
+获取当前goroutine添加到链表尾
+```
+func notifyListWait(l *notifyList, t uint32) {
+    lock(&l.lock)
+
+    // Return right away if this ticket has already been notified.
+    if less(t, l.notify) {
+        unlock(&l.lock)
+        return
+    }
+
+    // Enqueue itself.
+    s := acquireSudog()
+    s.g = getg()
+    s.ticket = t
+    s.releasetime = 0
+    t0 := int64(0)
+    if blockprofilerate > 0 {
+        t0 = cputicks()
+        s.releasetime = -1
+    }
+    if l.tail == nil {
+        l.head = s
+    } else {
+        l.tail.next = s
+    }
+    l.tail = s
+    goparkunlock(&l.lock, "semacquire", traceEvGoBlockCond, 3)
+    if t0 != 0 {
+        blockevent(s.releasetime-t0, 2)
+    }
+    releaseSudog(s)
 }
 ```
 > 若没有Wait()，通知后也不会报错
