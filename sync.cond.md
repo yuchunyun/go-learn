@@ -1,6 +1,84 @@
 package:  sync
 
-Cond实现了一个条件变量，一个等待或宣布事件发生的goroutines的集合点
+sync.Cond 对标 同步原语“条件变量”，它可以阻塞一个，或同时阻塞多个线程，直到另一个线程 
+1. 修改了共享变量
+2. 通知该条件变量
+
+首先，我们把概念搞清楚，条件变量的作用是控制多个线程对一个共享变量的读写。我们有三类主体：
+
+- 共享变量：条件变量控制多个线程对该变量的读写
+- 等待线程：被条件变量阻塞的线程，有一个或多个
+- 更新线程：更新共享变量，并唤起一个或多个等待线程
+
+> 比喻：KTV里只有一个话筒，N个人都想唱歌，但一个话筒只能被一个人使用。这个话筒就是共享变量，这个N-1个人就是等待线程，一个人告诉大家唱完了就是更新线程。而不需要在一个人唱歌的时候N-1个人都一直盯着话筒，他们只需要等待唱完了的人告诉他们就行了
+# 应用场景
+
+多个goroutine都需要操作共享资源时，为了维持数据统一会在操作前加锁，操作完成后解锁，这也会导致某一时刻只有一个goroutine正在操作资源，其他goroutine出于等待锁的状态。如果有的goroutine只是在共享资源满足某些条件时才需要操作资源呢？是不是这些goroutine也需要循环的去抢占锁，然后判断条件，然后解锁呢？
+
+# 应用模拟
+```
+package main
+
+import (
+        "fmt"
+        "sync"
+        "time"
+)
+
+type Test struct {
+        lock sync.RWMutex
+        ID   int
+        cond *sync.Cond
+}
+
+func main() {
+        test := &Test{ID: 1}
+        test.cond = sync.NewCond(&test.lock)
+        go test.worker1()
+        go test.worker2()
+        test.write()
+}
+
+func (t *Test) write() {
+        for t.ID != 100 {
+                t.lock.Lock()
+                t.ID += 1
+                t.lock.Unlock()
+                if t.ID%3 == 0 {
+                        t.cond.Broadcast()
+                }
+                time.Sleep(time.Duration(2) * time.Second)
+        }
+        return
+}
+
+func (t *Test) worker1() {
+        for {
+                fmt.Println("in worker1")
+                t.lock.Lock()
+                t.cond.Wait()
+                fmt.Printf("id equal %d, multiple of 3, so add 10!\n", t.ID)
+                t.ID += 10
+                t.lock.Unlock()
+        }
+        return
+}
+
+func (t *Test) worker2() {
+        for {
+                fmt.Println("in worker2")
+                t.lock.Lock()
+                t.cond.Wait()
+                fmt.Printf("id equal %d, multiple of 3, so print!\n", t.ID)
+                t.lock.Unlock()
+        }
+        return
+}
+```
+
+- write: 负责持续变更共享变量t，当共享变量是3的倍数时通知也需要操作共享变量的goroutine
+- worker1: 收到通知前挂起goroutine，收到通知后进行加10(写操作)
+- worker2: 收到同之前挂起goroutine，收到通知后进行打印（读操作）
 
 # 结构体
 ```
